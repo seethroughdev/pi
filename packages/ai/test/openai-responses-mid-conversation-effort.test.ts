@@ -330,6 +330,37 @@ describe("OpenAI Responses mid-conversation effort", () => {
 		});
 	});
 
+	it("keeps effort updates aligned when transformation inserts tool results and removes failed turns", async () => {
+		const model = supportedModel();
+		const toolTurn = response(model, "low");
+		toolTurn.content = [{ type: "toolCall", id: "call_1|fc_1", name: "run", arguments: {} }];
+		toolTurn.stopReason = "toolUse";
+		const failedTurn = { ...response(model, "high"), stopReason: "error" as const };
+		const result = await capture(
+			model,
+			{
+				systemPrompt: "Initial instructions",
+				messages: [
+					user("one", 1),
+					toolTurn,
+					{ role: "system", content: "Later instructions", timestamp: 2 },
+					failedTurn,
+					user("two", 3),
+				],
+			},
+			"high",
+		);
+		expect(result.payload.reasoning?.effort).toBe("low");
+		expect(configurationUpdates(result.payload)).toEqual(["high"]);
+		expect(result.payload.input.slice(-4)).toEqual([
+			{ type: "function_call_output", call_id: "call_1", output: "No result provided" },
+			{ role: "developer", content: "Later instructions" },
+			{ type: "configuration_update", reasoning: { effort: "high" } },
+			{ role: "user", content: [{ type: "input_text", text: "two" }] },
+		]);
+		expect(result.message.providerThinkingLevel).toBe("high");
+	});
+
 	it("does not apply a new selection backward to a completed legacy turn", async () => {
 		const model = supportedModel();
 		const completedLegacyTurn = response(model);

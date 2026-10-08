@@ -25,7 +25,14 @@ import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertPreparedResponsesMessages,
+	convertResponsesMessages,
+	convertResponsesTools,
+	planResponsesEffort,
+	prepareResponsesMessages,
+	processResponsesStream,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions, resolveSamplingParams } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -415,20 +422,20 @@ function buildParams(
 		if (options?.reasoningEffort !== undefined && model.thinkingLevelMap?.[options.reasoningEffort] === null) {
 			throw new Error(`Unsupported reasoning effort ${options.reasoningEffort} for ${model.provider}/${model.id}`);
 		}
-		const converted = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
-			...conversionOptions,
-			midConvoEffort: {
-				current: typeof params.reasoning?.effort === "string" ? params.reasoning.effort : undefined,
-			},
-		});
-		params.input = converted.input;
-		effectiveEffort = converted.effectiveEffort;
-		if (converted.baselineEffort !== undefined) {
+		const prepared = prepareResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, conversionOptions);
+		const effortPlan = planResponsesEffort(
+			model,
+			prepared.messages,
+			typeof params.reasoning?.effort === "string" ? params.reasoning.effort : undefined,
+		);
+		params.input = convertPreparedResponsesMessages(model, prepared, conversionOptions, effortPlan.updates);
+		effectiveEffort = effortPlan.effectiveEffort;
+		if (effortPlan.baselineEffort !== undefined) {
 			params.reasoning = {
-				effort: converted.baselineEffort as NonNullable<typeof params.reasoning>["effort"],
-				...(converted.baselineEffort === "none" ? {} : { summary: options?.reasoningSummary || "auto" }),
+				effort: effortPlan.baselineEffort as NonNullable<typeof params.reasoning>["effort"],
+				...(effortPlan.baselineEffort === "none" ? {} : { summary: options?.reasoningSummary || "auto" }),
 			};
-			if (converted.baselineEffort === "none") delete params.include;
+			if (effortPlan.baselineEffort === "none") delete params.include;
 			else params.include = ["reasoning.encrypted_content"];
 		}
 	} else {

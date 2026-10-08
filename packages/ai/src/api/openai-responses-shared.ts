@@ -18,6 +18,7 @@ import type {
 	Api,
 	AssistantMessage,
 	ImageContent,
+	Message,
 	Model,
 	StopReason,
 	StreamOptions,
@@ -129,8 +130,6 @@ export interface ConvertResponsesMessagesOptions {
 	supportsMidConvoSystemMessages?: boolean;
 	supportsAdditionalTools?: boolean;
 	supportsToolSearch?: boolean;
-	/** Requested native effort for supported public OpenAI Responses models. */
-	midConvoEffort?: { current?: string };
 	toolOptions?: ConvertResponsesToolsOptions;
 }
 
@@ -149,22 +148,19 @@ export function convertResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
 	context: TranscriptContext,
 	allowedToolCallProviders: ReadonlySet<string>,
-	options: ConvertResponsesMessagesOptions & { midConvoEffort: { current?: string } },
-): { input: ResponseInput; baselineEffort?: string; effectiveEffort?: string };
-export function convertResponsesMessages<TApi extends Api>(
+	options?: ConvertResponsesMessagesOptions,
+): ResponseInput {
+	const prepared = prepareResponsesMessages(model, context, allowedToolCallProviders, options);
+	return convertPreparedResponsesMessages(model, prepared, options);
+}
+
+export function prepareResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
 	context: TranscriptContext,
 	allowedToolCallProviders: ReadonlySet<string>,
 	options?: ConvertResponsesMessagesOptions,
-): ResponseInput;
-export function convertResponsesMessages<TApi extends Api>(
-	model: Model<TApi>,
-	context: TranscriptContext,
-	allowedToolCallProviders: ReadonlySet<string>,
-	options?: ConvertResponsesMessagesOptions,
-): ResponseInput | { input: ResponseInput; baselineEffort?: string; effectiveEffort?: string } {
+): TranscriptContext {
 	const normalizedContext = resolveTranscript(context, options?.supportsMidConvoSystemMessages);
-	const messages: ResponseInput = [];
 
 	const normalizeIdPart = (part: string): string => {
 		const sanitized = part.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -191,48 +187,71 @@ export function convertResponsesMessages<TApi extends Api>(
 		return `${normalizedCallId}|${normalizedItemId}`;
 	};
 
-	const transformedMessages = transformMessages(normalizedContext.messages, model, normalizeToolCallId);
+	return {
+		...normalizedContext,
+		messages: transformMessages(normalizedContext.messages, model, normalizeToolCallId),
+	};
+}
+
+export function planResponsesEffort(
+	model: Model<Api>,
+	messages: readonly Message[],
+	currentEffort: string | undefined,
+): { updates: ReadonlyMap<number, string>; baselineEffort?: string; effectiveEffort?: string } {
 	// Effort is recorded on the assistant, but updates must precede its user turn.
 	const effortForUserTurn = new Map<number, string>();
 	let latestUserIndex: number | undefined;
 	let latestUserHasResponse = false;
 	let baselineEffort: string | undefined;
 	let effectiveEffort: string | undefined;
-	if (options?.midConvoEffort) {
-		for (let index = 0; index < transformedMessages.length; index++) {
-			const message = transformedMessages[index];
-			if (message.role === "user" && isEmittedUserMessage(message)) {
-				latestUserIndex = index;
+	for (let index = 0; index < messages.length; index++) {
+		const message = messages[index];
+		if (message.role === "user" && isEmittedUserMessage(message)) {
+			latestUserIndex = index;
+			latestUserHasResponse = false;
+		} else if (
+			message.role === "assistant" &&
+			(message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse")
+		) {
+			if (message.api !== model.api || message.provider !== model.provider || message.model !== model.id) {
+				effortForUserTurn.clear();
+				baselineEffort = undefined;
+				effectiveEffort = undefined;
+				latestUserIndex = undefined;
 				latestUserHasResponse = false;
-			} else if (
-				message.role === "assistant" &&
-				(message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse")
-			) {
-				if (message.api !== model.api || message.provider !== model.provider || message.model !== model.id) {
-					effortForUserTurn.clear();
-					baselineEffort = undefined;
-					effectiveEffort = undefined;
-					latestUserIndex = undefined;
-					latestUserHasResponse = false;
-					continue;
-				}
-				latestUserHasResponse = latestUserIndex !== undefined;
-				if (typeof message.providerThinkingLevel === "string") {
-					baselineEffort ??= message.providerThinkingLevel;
-					effectiveEffort = message.providerThinkingLevel;
-					if (latestUserIndex !== undefined) effortForUserTurn.set(latestUserIndex, message.providerThinkingLevel);
-				}
+				continue;
+			}
+			latestUserHasResponse = latestUserIndex !== undefined;
+			if (typeof message.providerThinkingLevel === "string") {
+				baselineEffort ??= message.providerThinkingLevel;
+				effectiveEffort = message.providerThinkingLevel;
+				if (latestUserIndex !== undefined) effortForUserTurn.set(latestUserIndex, message.providerThinkingLevel);
 			}
 		}
-		baselineEffort ??= options.midConvoEffort.current;
-		if (latestUserIndex !== undefined && !latestUserHasResponse && options.midConvoEffort.current) {
-			effortForUserTurn.set(latestUserIndex, options.midConvoEffort.current);
-			effectiveEffort = options.midConvoEffort.current;
-		}
+	}
+	baselineEffort ??= currentEffort;
+	if (latestUserIndex !== undefined && !latestUserHasResponse && currentEffort) {
+		effortForUserTurn.set(latestUserIndex, currentEffort);
+		effectiveEffort = currentEffort;
 	}
 	let previousEffort = baselineEffort;
+	for (const [index, effort] of effortForUserTurn) {
+		if (effort === previousEffort) effortForUserTurn.delete(index);
+		else previousEffort = effort;
+	}
+	return { updates: effortForUserTurn, baselineEffort, effectiveEffort: effectiveEffort ?? baselineEffort };
+}
+
+/** Convert the exact transcript returned by prepareResponsesMessages; update indexes refer to that sequence. */
+export function convertPreparedResponsesMessages<TApi extends Api>(
+	model: Model<TApi>,
+	context: TranscriptContext,
+	options?: ConvertResponsesMessagesOptions,
+	effortUpdates?: ReadonlyMap<number, string>,
+): ResponseInput {
+	const messages: ResponseInput = [];
 	const transcriptTools = resolveTranscriptTools(
-		normalizedContext.messages,
+		context.messages,
 		(options?.supportsAdditionalTools ?? false) || (options?.supportsToolSearch ?? false),
 	);
 	const appendSystemToolAdditions = (message: SystemMessage, seed: string): void => {
@@ -270,7 +289,7 @@ export function convertResponsesMessages<TApi extends Api>(
 
 	let msgIndex = 0;
 	let sourceIndex = 0;
-	for (const msg of transformedMessages) {
+	for (const msg of context.messages) {
 		const isLeadingSystemMessage = sourceIndex++ === 0 && msg.role === "system";
 		if (msg.role === "system") {
 			if (!isLeadingSystemMessage) appendSystemToolAdditions(msg, `system:${msgIndex}`);
@@ -281,14 +300,13 @@ export function convertResponsesMessages<TApi extends Api>(
 				}
 			}
 		} else if (msg.role === "user") {
-			if (options?.midConvoEffort && !isEmittedUserMessage(msg)) continue;
-			const effort = effortForUserTurn.get(sourceIndex - 1);
-			if (effort !== undefined && effort !== previousEffort) {
+			if (effortUpdates && !isEmittedUserMessage(msg)) continue;
+			const effort = effortUpdates?.get(sourceIndex - 1);
+			if (effort !== undefined) {
 				messages.push({
 					type: "configuration_update",
 					reasoning: { effort },
 				} as ResponseInputItem);
-				previousEffort = effort;
 			}
 			if (typeof msg.content === "string") {
 				messages.push({
@@ -413,8 +431,7 @@ export function convertResponsesMessages<TApi extends Api>(
 		if (!isLeadingSystemMessage) msgIndex++;
 	}
 
-	if (!options?.midConvoEffort) return messages;
-	return { input: messages, baselineEffort, effectiveEffort: effectiveEffort ?? baselineEffort };
+	return messages;
 }
 
 function isEmittedUserMessage(message: UserMessage): boolean {
