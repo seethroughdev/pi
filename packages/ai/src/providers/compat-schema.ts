@@ -378,6 +378,12 @@ export const OpenAIResponsesCompatSchema = Type.Object(
 				"Whether to emit OpenAI custom tools with Lark or regex grammar formats. When false, grammar-constrained tools fall back to normal function tools. The generated catalog enables this for capable models.",
 			default: false,
 		}),
+		supportsMidConvoEffort: Type.Optional(
+			Type.Boolean({
+				description: "Whether this model supports mid-conversation reasoning effort updates on public Responses.",
+				default: false,
+			}),
+		),
 		supportsAdditionalTools: Type.Optional(
 			Type.Boolean({
 				description: "Whether the model supports message-anchored additional_tools input items.",
@@ -515,6 +521,10 @@ export const MistralConversationsCompatSchema = Type.Object(
 );
 
 const ProviderCompatPropertyOverrides = {
+	supportsMidConvoEffort: optionalCompatBoolean({
+		description: "Whether the exact model transport supports mid-conversation effort updates.",
+		default: false,
+	}),
 	supportsDeveloperRole: optionalCompatBoolean({
 		description: "Whether the provider supports the developer role instead of system. Defaults are API-specific.",
 	}),
