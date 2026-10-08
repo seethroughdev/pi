@@ -91,6 +91,7 @@ function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCo
 		supportsToolSearch: model.compat?.supportsToolSearch ?? false,
 		supportsExplicitPromptCacheMode: model.compat?.supportsExplicitPromptCacheMode ?? false,
 		supportsMaxOutputTokens: model.compat?.supportsMaxOutputTokens ?? true,
+		supportsMidConvoEffort: model.compat?.supportsMidConvoEffort ?? false,
 	};
 }
 
@@ -111,6 +112,29 @@ function getPromptCacheOptions(
 	if (cacheRetention === "none") return { mode: "explicit" };
 	if (cacheRetention === "long" && compat.supportsLongCacheRetention) return { ttl: "30m" };
 	return undefined;
+}
+
+function validateMidConvoEffortParams(
+	params: ResponseCreateParamsStreaming,
+	expected: { model: string; input: string | undefined; effort: unknown },
+): void {
+	if (
+		params.model !== expected.model ||
+		JSON.stringify(params.input) !== expected.input ||
+		params.reasoning?.effort !== expected.effort ||
+		params.stream !== true ||
+		params.store !== false ||
+		params.truncation === "auto" ||
+		params.background === true ||
+		params.conversation != null ||
+		params.previous_response_id != null ||
+		params.prompt != null ||
+		(params as unknown as Record<string, unknown>).context_management != null
+	) {
+		throw new Error(
+			"OpenAI mid-conversation effort requires the generated model, input, reasoning, and stateless request mode",
+		);
+	}
 }
 
 // OpenAI Responses-specific options
@@ -170,11 +194,13 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				options?.fetch,
 				cacheSessionId,
 			);
-			let params = buildParams(model, normalizedContext, options, compat, grammarToolInputProperties);
+			const built = buildParams(model, normalizedContext, options, compat, grammarToolInputProperties);
+			let params = built.params;
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
+			if (built.managedPayload) validateMidConvoEffortParams(params, built.managedPayload);
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -209,6 +235,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 
+			if (built.effectiveEffort) output.providerThinkingLevel = built.effectiveEffort;
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -313,23 +340,12 @@ function buildParams(
 		context.messages,
 		compat.supportsAdditionalTools || compat.supportsToolSearch,
 	);
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
-		grammarToolInputProperties,
-		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
-		supportsAdditionalTools: compat.supportsAdditionalTools,
-		supportsToolSearch: compat.supportsToolSearch,
-		toolOptions: {
-			supportsStrictMode: compat.supportsStrictMode,
-			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
-		},
-	});
-
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	// Sign in with ChatGPT rejects these request fields.
 	const omitUnsupportedFields = isChatGPTSignIn(model, options?.apiKey);
 	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
-		input: messages,
+		input: [],
 		stream: true,
 		prompt_cache_key: cacheRetention === "none" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
 		prompt_cache_retention: omitUnsupportedFields ? undefined : getPromptCacheRetention(compat, cacheRetention),
@@ -379,13 +395,56 @@ function buildParams(
 		if (model.provider === "xai") params.include = ["reasoning.encrypted_content"];
 	}
 
+	const conversionOptions = {
+		grammarToolInputProperties,
+		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
+		supportsAdditionalTools: compat.supportsAdditionalTools,
+		supportsToolSearch: compat.supportsToolSearch,
+		toolOptions: {
+			supportsStrictMode: compat.supportsStrictMode,
+			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
+		},
+	};
+	const midConvoEffortEnabled =
+		compat.supportsMidConvoEffort &&
+		model.api === "openai-responses" &&
+		model.provider === "openai" &&
+		model.baseUrl === "https://api.openai.com/v1";
+	let effectiveEffort: string | undefined;
+	if (midConvoEffortEnabled) {
+		if (options?.reasoningEffort !== undefined && model.thinkingLevelMap?.[options.reasoningEffort] === null) {
+			throw new Error(`Unsupported reasoning effort ${options.reasoningEffort} for ${model.provider}/${model.id}`);
+		}
+		const converted = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+			...conversionOptions,
+			midConvoEffort: {
+				current: typeof params.reasoning?.effort === "string" ? params.reasoning.effort : undefined,
+			},
+		});
+		params.input = converted.input;
+		effectiveEffort = converted.effectiveEffort;
+		if (converted.baselineEffort !== undefined) {
+			params.reasoning = {
+				effort: converted.baselineEffort as NonNullable<typeof params.reasoning>["effort"],
+				...(converted.baselineEffort === "none" ? {} : { summary: options?.reasoningSummary || "auto" }),
+			};
+			if (converted.baselineEffort === "none") delete params.include;
+			else params.include = ["reasoning.encrypted_content"];
+		}
+	} else {
+		params.input = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, conversionOptions);
+	}
+
+	const managedPayload = midConvoEffortEnabled
+		? { model: model.id, input: JSON.stringify(params.input), effort: params.reasoning?.effort }
+		: undefined;
 	// Last so model and request sampling parameters override named request fields.
 	const samplingParams = resolveSamplingParams(model, reasoningEffort ?? "off", options?.samplingParams);
 	if (samplingParams) {
 		Object.assign(params, samplingParams);
 	}
 
-	return params;
+	return { params, effectiveEffort, managedPayload };
 }
 
 function getServiceTierCostMultiplier(

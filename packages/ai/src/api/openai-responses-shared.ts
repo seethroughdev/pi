@@ -29,6 +29,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 	Usage,
+	UserMessage,
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -128,6 +129,8 @@ export interface ConvertResponsesMessagesOptions {
 	supportsMidConvoSystemMessages?: boolean;
 	supportsAdditionalTools?: boolean;
 	supportsToolSearch?: boolean;
+	/** Requested native effort for supported public OpenAI Responses models. */
+	midConvoEffort?: { current?: string };
 	toolOptions?: ConvertResponsesToolsOptions;
 }
 
@@ -146,8 +149,20 @@ export function convertResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
 	context: TranscriptContext,
 	allowedToolCallProviders: ReadonlySet<string>,
+	options: ConvertResponsesMessagesOptions & { midConvoEffort: { current?: string } },
+): { input: ResponseInput; baselineEffort?: string; effectiveEffort?: string };
+export function convertResponsesMessages<TApi extends Api>(
+	model: Model<TApi>,
+	context: TranscriptContext,
+	allowedToolCallProviders: ReadonlySet<string>,
 	options?: ConvertResponsesMessagesOptions,
-): ResponseInput {
+): ResponseInput;
+export function convertResponsesMessages<TApi extends Api>(
+	model: Model<TApi>,
+	context: TranscriptContext,
+	allowedToolCallProviders: ReadonlySet<string>,
+	options?: ConvertResponsesMessagesOptions,
+): ResponseInput | { input: ResponseInput; baselineEffort?: string; effectiveEffort?: string } {
 	const normalizedContext = resolveTranscript(context, options?.supportsMidConvoSystemMessages);
 	const messages: ResponseInput = [];
 
@@ -177,6 +192,45 @@ export function convertResponsesMessages<TApi extends Api>(
 	};
 
 	const transformedMessages = transformMessages(normalizedContext.messages, model, normalizeToolCallId);
+	// Effort is recorded on the assistant, but updates must precede its user turn.
+	const effortForUserTurn = new Map<number, string>();
+	let latestUserIndex: number | undefined;
+	let latestUserHasResponse = false;
+	let baselineEffort: string | undefined;
+	let effectiveEffort: string | undefined;
+	if (options?.midConvoEffort) {
+		for (let index = 0; index < transformedMessages.length; index++) {
+			const message = transformedMessages[index];
+			if (message.role === "user" && isEmittedUserMessage(message)) {
+				latestUserIndex = index;
+				latestUserHasResponse = false;
+			} else if (
+				message.role === "assistant" &&
+				(message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse")
+			) {
+				if (message.api !== model.api || message.provider !== model.provider || message.model !== model.id) {
+					effortForUserTurn.clear();
+					baselineEffort = undefined;
+					effectiveEffort = undefined;
+					latestUserIndex = undefined;
+					latestUserHasResponse = false;
+					continue;
+				}
+				latestUserHasResponse = latestUserIndex !== undefined;
+				if (typeof message.providerThinkingLevel === "string") {
+					baselineEffort ??= message.providerThinkingLevel;
+					effectiveEffort = message.providerThinkingLevel;
+					if (latestUserIndex !== undefined) effortForUserTurn.set(latestUserIndex, message.providerThinkingLevel);
+				}
+			}
+		}
+		baselineEffort ??= options.midConvoEffort.current;
+		if (latestUserIndex !== undefined && !latestUserHasResponse && options.midConvoEffort.current) {
+			effortForUserTurn.set(latestUserIndex, options.midConvoEffort.current);
+			effectiveEffort = options.midConvoEffort.current;
+		}
+	}
+	let previousEffort = baselineEffort;
 	const transcriptTools = resolveTranscriptTools(
 		normalizedContext.messages,
 		(options?.supportsAdditionalTools ?? false) || (options?.supportsToolSearch ?? false),
@@ -227,6 +281,15 @@ export function convertResponsesMessages<TApi extends Api>(
 				}
 			}
 		} else if (msg.role === "user") {
+			if (options?.midConvoEffort && !isEmittedUserMessage(msg)) continue;
+			const effort = effortForUserTurn.get(sourceIndex - 1);
+			if (effort !== undefined && effort !== previousEffort) {
+				messages.push({
+					type: "configuration_update",
+					reasoning: { effort },
+				} as ResponseInputItem);
+				previousEffort = effort;
+			}
 			if (typeof msg.content === "string") {
 				messages.push({
 					role: "user",
@@ -350,7 +413,13 @@ export function convertResponsesMessages<TApi extends Api>(
 		if (!isLeadingSystemMessage) msgIndex++;
 	}
 
-	return messages;
+	if (!options?.midConvoEffort) return messages;
+	return { input: messages, baselineEffort, effectiveEffort: effectiveEffort ?? baselineEffort };
+}
+
+function isEmittedUserMessage(message: UserMessage): boolean {
+	if (typeof message.content === "string") return message.content.trim().length > 0;
+	return message.content.some((item) => item.type === "image" || item.text.trim().length > 0);
 }
 
 // =============================================================================

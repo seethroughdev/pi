@@ -976,6 +976,27 @@ function applyOpenAIExplicitPromptCacheMetadata(model: Model<Api>): void {
 	};
 }
 
+const OPENAI_RESPONSES_MID_CONVO_EFFORT_MODEL_IDS = new Set([
+	"gpt-6-astra",
+	"gpt-6-sol",
+	"gpt-6-luna",
+	"gpt-6.1-sol",
+]);
+
+function applyOpenAIMidConvoEffortMetadata(model: Model<Api>): void {
+	if (
+		model.provider !== "openai" ||
+		model.api !== "openai-responses" ||
+		!OPENAI_RESPONSES_MID_CONVO_EFFORT_MODEL_IDS.has(model.id)
+	) {
+		return;
+	}
+	model.compat = {
+		...(model.compat as OpenAIResponsesCompat | undefined),
+		supportsMidConvoEffort: true,
+	};
+}
+
 // Anthropic ephemeral entries have a hard five-minute lifetime; `ttl: "1h"`
 // extends it to one hour. Only direct Anthropic is annotated so cache warming
 // does not assume equivalent behavior through proxies.
@@ -3355,6 +3376,7 @@ async function generateModels() {
 		applyOpenAICompletionsTranscriptMetadata(model);
 		applyOpenAIResponsesTranscriptMetadata(model);
 		applyOpenAIExplicitPromptCacheMetadata(model);
+		applyOpenAIMidConvoEffortMetadata(model);
 		applyPromptCacheMetadata(model);
 		applyImageInputMetadata(model);
 	}
